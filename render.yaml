@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: agent-ops-mcp
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        sync: false
+    autoDeploy: true
