@@ -253,13 +253,14 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (path === "/" || path === "/health") {
+  if (path === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ name: "agent-ops", status: "ok" }));
     return;
   }
 
-  if (path !== "/mcp") {
+  const isMcpPath = path === "/" || path === "/mcp";
+  if (!isMcpPath) {
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "not_found" }));
     return;
