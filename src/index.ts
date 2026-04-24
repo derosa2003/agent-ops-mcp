@@ -3,6 +3,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
+import {
+  baseUrl,
+  handleAuthServerMetadata,
+  handleAuthorize,
+  handleProtectedResourceMetadata,
+  handleRegister,
+  handleToken,
+  validateAccessToken,
+} from "./oauth.js";
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -221,17 +230,54 @@ const transport = new StreamableHTTPServerTransport({
 });
 
 const httpServer = http.createServer(async (req, res) => {
-  const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
-    res.writeHead(401, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized" }));
+  const path = (req.url ?? "/").split("?")[0];
+
+  if (path === "/.well-known/oauth-authorization-server") {
+    handleAuthServerMetadata(req, res);
     return;
   }
-  if (!req.url || !req.url.startsWith("/mcp")) {
+  if (path === "/.well-known/oauth-protected-resource") {
+    handleProtectedResourceMetadata(req, res);
+    return;
+  }
+  if (path === "/register") {
+    await handleRegister(req, res);
+    return;
+  }
+  if (path === "/authorize") {
+    await handleAuthorize(req, res);
+    return;
+  }
+  if (path === "/token") {
+    await handleToken(req, res);
+    return;
+  }
+
+  if (path === "/" || path === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ name: "agent-ops", status: "ok" }));
+    return;
+  }
+
+  if (path !== "/mcp") {
     res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Not Found" }));
+    res.end(JSON.stringify({ error: "not_found" }));
     return;
   }
+
+  const authHeader = req.headers.authorization;
+  const match = authHeader ? authHeader.match(/^Bearer\s+(.+)$/i) : null;
+  const accessToken = match ? match[1] : null;
+  if (!accessToken || !validateAccessToken(accessToken)) {
+    const base = baseUrl(req);
+    res.writeHead(401, {
+      "content-type": "application/json",
+      "www-authenticate": `Bearer realm="mcp", resource_metadata="${base}/.well-known/oauth-protected-resource"`,
+    });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
   let body: unknown = undefined;
   if (req.method === "POST") {
     const chunks: Buffer[] = [];
@@ -242,7 +288,7 @@ const httpServer = http.createServer(async (req, res) => {
         body = JSON.parse(raw);
       } catch {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        res.end(JSON.stringify({ error: "invalid_json" }));
         return;
       }
     }
