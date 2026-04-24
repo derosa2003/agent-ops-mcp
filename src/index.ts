@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -215,16 +216,38 @@ server.tool(
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
 
-const transport = new StreamableHTTPServerTransport({ path: "/mcp" });
+const transport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: () => randomUUID(),
+});
 
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
   const auth = req.headers.authorization;
   if (!auth || auth !== `Bearer ${MCP_AUTH_TOKEN}`) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized" }));
     return;
   }
-  transport.handleRequest(req, res);
+  if (!req.url || !req.url.startsWith("/mcp")) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
+    return;
+  }
+  let body: unknown = undefined;
+  if (req.method === "POST") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const raw = Buffer.concat(chunks).toString("utf-8");
+    if (raw.length > 0) {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+    }
+  }
+  await transport.handleRequest(req, res, body);
 });
 
 await server.connect(transport);
