@@ -50,9 +50,17 @@ const server = new McpServer({ name: "agent-ops", version: "1.0.0" });
 
 server.tool(
   "list_agents",
-  "List all agents in your Anthropic Console",
-  {},
-  async () => ok(await api("/agents"))
+  "List all agents in your Anthropic Console. By default excludes archived agents.",
+  {
+    include_archived: z
+      .boolean()
+      .optional()
+      .describe("Include archived agents in the list (default false)"),
+  },
+  async ({ include_archived }) => {
+    const qs = include_archived ? "?include_archived=true" : "";
+    return ok(await api(`/agents${qs}`));
+  }
 );
 
 server.tool(
@@ -71,63 +79,67 @@ server.tool(
 
 server.tool(
   "create_agent",
-  "Create a new agent configuration in Anthropic Console",
+  "Create a new agent configuration in Anthropic Console. Name must be 1-256 chars. System prompt is limited to 100KB. Max 50 tools, 64 skills, 20 MCP servers.",
   {
-    name: z.string().describe("Human-readable name for the agent"),
-    model_id: z.string().describe("Model ID, e.g. claude-opus-4-7 or claude-sonnet-4-6"),
-    system: z.string().describe("The system prompt that defines what this agent does"),
-    description: z.string().optional().describe("Optional description"),
+    name: z.string().describe("Human-readable name (1-256 chars)"),
+    model: z.string().describe("Model ID, e.g. claude-opus-4-7 or claude-sonnet-4-6"),
+    system: z.string().describe("System prompt that defines what this agent does (max 100KB)"),
+    description: z.string().optional(),
     include_default_toolset: z
       .boolean()
       .default(true)
-      .describe("Whether to include the default agent toolset (bash, file ops, web search, etc)"),
+      .describe("Include the default agent toolset (bash, file ops, web search, etc)"),
+    skills: z
+      .array(z.string())
+      .optional()
+      .describe("Optional array of skill IDs to attach"),
   },
-  async ({ name, model_id, system, description, include_default_toolset }) =>
-    ok(
+  async ({ name, model, system, description, include_default_toolset, skills }) => {
+    const body: Record<string, unknown> = { name, model, system };
+    if (description) body.description = description;
+    if (include_default_toolset) {
+      body.tools = [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { permission_policy: { type: "always_allow" } },
+        },
+      ];
+    }
+    if (skills && skills.length > 0) {
+      body.skills = skills.map((id) => ({ id }));
+    }
+    return ok(
       await api("/agents", {
         method: "POST",
-        body: JSON.stringify({
-          name,
-          model: { id: model_id },
-          system,
-          ...(description && { description }),
-          tools: include_default_toolset
-            ? [
-                {
-                  type: "agent_toolset_20260401",
-                  default_config: { permission_policy: { type: "always_allow" } },
-                },
-              ]
-            : [],
-        }),
+        body: JSON.stringify(body),
       })
-    )
+    );
+  }
 );
 
 server.tool(
   "update_agent",
-  "Update an agent — system prompt, name, model, or description. Only include fields you want to change. Requires current version number to prevent overwriting concurrent changes.",
+  "Update an agent — system prompt, name, model, or description. Only pass fields you want to change. Creates a new agent version; fetch the latest with get_agent first if you need the current state.",
   {
     agent_id: z.string(),
-    version: z.number().describe("Current version number — get this from get_agent first"),
-    system: z.string().optional().describe("New system prompt"),
-    name: z.string().optional().describe("New name"),
-    model_id: z.string().optional().describe("New model ID"),
+    system: z.string().optional().describe("New system prompt (max 100KB)"),
+    name: z.string().optional().describe("New name (1-256 chars)"),
+    model: z.string().optional().describe("New model ID"),
     description: z.string().optional(),
   },
-  async ({ agent_id, version, system, name, model_id, description }) =>
-    ok(
+  async ({ agent_id, system, name, model, description }) => {
+    const body: Record<string, unknown> = {};
+    if (system !== undefined) body.system = system;
+    if (name !== undefined) body.name = name;
+    if (model !== undefined) body.model = model;
+    if (description !== undefined) body.description = description;
+    return ok(
       await api(`/agents/${agent_id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          version,
-          ...(system !== undefined && { system }),
-          ...(name !== undefined && { name }),
-          ...(model_id !== undefined && { model: { id: model_id } }),
-          ...(description !== undefined && { description }),
-        }),
+        method: "POST",
+        body: JSON.stringify(body),
       })
-    )
+    );
+  }
 );
 
 server.tool(
@@ -139,32 +151,112 @@ server.tool(
 );
 
 // ── SESSIONS ──────────────────────────────────────────────────────────────────
+// A session is a stateful running conversation with an agent inside a sandbox
+// container (environment). Lifecycle: create_session → send_message → list_session_events
+// (repeat) → archive_session when done (to stop idle billing).
 
 server.tool(
   "list_sessions",
-  "List recent agent sessions, optionally filtered by agent",
+  "List recent agent sessions. Supports optional pagination cursor.",
   {
-    agent_id: z.string().optional().describe("Filter sessions by a specific agent ID"),
+    cursor: z.string().optional().describe("Pagination cursor from a previous response"),
+    limit: z.number().int().min(1).max(100).optional(),
   },
-  async ({ agent_id }) => {
-    const qs = agent_id ? `?agent_id=${agent_id}` : "";
+  async ({ cursor, limit }) => {
+    const params = new URLSearchParams();
+    if (cursor) params.set("cursor", cursor);
+    if (limit) params.set("limit", String(limit));
+    const qs = params.toString() ? `?${params.toString()}` : "";
     return ok(await api(`/sessions${qs}`));
   }
 );
 
 server.tool(
   "get_session",
-  "Get the current status and details of a specific session",
+  "Get the current status and details of a specific session (running, stopped, failed, etc).",
   { session_id: z.string() },
   async ({ session_id }) => ok(await api(`/sessions/${session_id}`))
 );
 
 server.tool(
-  "stop_session",
-  "Stop a running session. Use this to avoid idle billing charges.",
+  "create_session",
+  "Start a new agent session. Requires an agent_id and an environment_id (use list_environments to find one). The session boots in a sandbox container and is immediately ready to receive messages via send_message.",
+  {
+    agent_id: z.string().describe("ID of the agent to run"),
+    environment_id: z.string().describe("ID of the environment (sandbox config)"),
+    title: z.string().optional().describe("Optional human-readable session title"),
+    agent_version: z
+      .number()
+      .optional()
+      .describe("Pin to a specific agent version. Omit to use latest."),
+  },
+  async ({ agent_id, environment_id, title, agent_version }) => {
+    const body: Record<string, unknown> = {
+      agent:
+        agent_version !== undefined
+          ? { type: "agent", id: agent_id, version: agent_version }
+          : agent_id,
+      environment_id,
+    };
+    if (title) body.title = title;
+    return ok(
+      await api("/sessions", {
+        method: "POST",
+        body: JSON.stringify(body),
+      })
+    );
+  }
+);
+
+server.tool(
+  "send_message",
+  "Send a user message to a running session. The agent will begin responding asynchronously; use list_session_events to read its response.",
+  {
+    session_id: z.string(),
+    text: z.string().describe("The message content to send to the agent"),
+  },
+  async ({ session_id, text }) =>
+    ok(
+      await api(`/sessions/${session_id}/events`, {
+        method: "POST",
+        body: JSON.stringify([
+          { type: "user.message", content: [{ type: "text", text }] },
+        ]),
+      })
+    )
+);
+
+server.tool(
+  "list_session_events",
+  "List events from a session — the agent's messages, tool calls, tool results, and user messages, in order. Use the returned cursor to poll for new events as the agent runs.",
+  {
+    session_id: z.string(),
+    cursor: z.string().optional().describe("Pagination cursor to fetch only events after a point"),
+    limit: z.number().int().min(1).max(100).optional(),
+  },
+  async ({ session_id, cursor, limit }) => {
+    const params = new URLSearchParams();
+    if (cursor) params.set("cursor", cursor);
+    if (limit) params.set("limit", String(limit));
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return ok(await api(`/sessions/${session_id}/events${qs}`));
+  }
+);
+
+server.tool(
+  "archive_session",
+  "Stop and archive a session. Use this when done with a session to halt any idle billing. Session events remain readable after archiving.",
   { session_id: z.string() },
   async ({ session_id }) =>
-    ok(await api(`/sessions/${session_id}/stop`, { method: "POST" }))
+    ok(await api(`/sessions/${session_id}/archive`, { method: "POST" }))
+);
+
+server.tool(
+  "delete_session",
+  "Permanently delete a session and its events. Cannot be undone. Prefer archive_session unless you need to purge data.",
+  { session_id: z.string() },
+  async ({ session_id }) =>
+    ok(await api(`/sessions/${session_id}`, { method: "DELETE" }))
 );
 
 // ── ENVIRONMENTS ──────────────────────────────────────────────────────────────
@@ -185,18 +277,28 @@ server.tool(
 
 server.tool(
   "create_environment",
-  "Create a new environment configuration — defines the sandbox container your agent sessions run in",
+  "Create a new environment — a sandbox container template that sessions run in. Config is optional; omitting it creates a default Linux sandbox. Rate-limited to 60 RPM with max 5 concurrent creations.",
   {
     name: z.string(),
     description: z.string().optional(),
+    config: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Optional container config object (e.g. { type, networking, packages }). Passed through raw to the API."
+      ),
   },
-  async ({ name, description }) =>
-    ok(
+  async ({ name, description, config }) => {
+    const body: Record<string, unknown> = { name };
+    if (description) body.description = description;
+    if (config) body.config = config;
+    return ok(
       await api("/environments", {
         method: "POST",
-        body: JSON.stringify({ name, ...(description && { description }) }),
+        body: JSON.stringify(body),
       })
-    )
+    );
+  }
 );
 
 server.tool(
@@ -208,19 +310,31 @@ server.tool(
 );
 
 // ── SKILLS ────────────────────────────────────────────────────────────────────
+// Skills use a different beta header than the rest of Managed Agents.
+
+const SKILLS_HEADERS = { "anthropic-beta": "skills-2025-10-02" };
 
 server.tool(
   "list_skills",
-  "List all custom skills uploaded to your Anthropic Console",
+  "List all custom skills uploaded to your Anthropic Console. Skills are reusable instructions and reference files you can attach to agents via create_agent or update_agent.",
   {},
-  async () => ok(await api("/skills"))
+  async () => ok(await api("/skills", { headers: SKILLS_HEADERS }))
 );
 
 server.tool(
   "get_skill",
-  "Get full details for a specific skill",
+  "Get full details for a specific skill, including its current version.",
   { skill_id: z.string() },
-  async ({ skill_id }) => ok(await api(`/skills/${skill_id}`))
+  async ({ skill_id }) =>
+    ok(await api(`/skills/${skill_id}`, { headers: SKILLS_HEADERS }))
+);
+
+server.tool(
+  "list_skill_versions",
+  "List the full version history of a skill.",
+  { skill_id: z.string() },
+  async ({ skill_id }) =>
+    ok(await api(`/skills/${skill_id}/versions`, { headers: SKILLS_HEADERS }))
 );
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
